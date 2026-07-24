@@ -544,7 +544,82 @@ function taskAction(model,name,code,fallback){
 }
 const sel=document.querySelector("#model"),kmInput=document.querySelector("#km");
 
-function printServiceSheet(){
+function pdfWinAnsi(text){
+ const extra={"€":128,"‚":130,"ƒ":131,"„":132,"…":133,"†":134,"‡":135,"ˆ":136,"‰":137,"Š":138,"‹":139,"Œ":140,"Ž":142,"‘":145,"’":146,"“":147,"”":148,"•":149,"–":150,"—":151,"˜":152,"™":153,"š":154,"›":155,"œ":156,"ž":158,"Ÿ":159};
+ return [...String(text)].map(char=>{
+   const code=char.charCodeAt(0);
+   if(extra[char]!==undefined)return String.fromCharCode(extra[char]);
+   if(code<=255)return char;
+   if(char==="−"||char==="‑")return "-";
+   return "?";
+ }).join("");
+}
+function pdfEscape(text){
+ return pdfWinAnsi(text).replace(/\\/g,"\\\\").replace(/\(/g,"\\(").replace(/\)/g,"\\)").replace(/[\r\n]+/g," ");
+}
+function wrapPdfText(text,maxLength=56){
+ const words=String(text).replace(/\s+/g," ").trim().split(" ");
+ const lines=[];
+ let line="";
+ words.forEach(word=>{
+   const candidate=line?`${line} ${word}`:word;
+   if(candidate.length>maxLength&&line){lines.push(line);line=word}else line=candidate;
+ });
+ if(line)lines.push(line);
+ return lines.length?lines:[""];
+}
+function createServicePdf(sheet){
+ const model=sheet.querySelector(".print-model")?.textContent.trim()||"VOGE";
+ const km=sheet.querySelector(".print-km")?.textContent.trim()||"";
+ const entries=[...sheet.querySelectorAll(".print-task")].map(item=>wrapPdfText(item.textContent,56));
+ const totalWeight=entries.reduce((sum,lines)=>sum+lines.length+0.45,0);
+ const left=[],right=[];
+ let accumulated=0,toRight=false;
+ entries.forEach(lines=>{
+   if(!toRight&&accumulated>=totalWeight/2)toRight=true;
+   (toRight?right:left).push(lines);
+   accumulated+=lines.length+0.45;
+ });
+ const commands=[];
+ const writeText=(font,size,x,y,text)=>commands.push(`BT /${font} ${size} Tf 1 0 0 1 ${x} ${y} Tm (${pdfEscape(text)}) Tj ET`);
+ writeText("F2",20,36,800,model);
+ writeText("F2",20,Math.max(320,559-(km.length*11)),800,km);
+ commands.push("0 G 1.5 w 36 783 m 559 783 l S");
+ const drawColumn=(groups,x)=>{
+   let y=761;
+   groups.forEach(lines=>{
+     lines.forEach((line,index)=>{
+       writeText(index===0?"F2":"F1",index===0?8.8:8.5,x,y,line);
+       y-=10.7;
+     });
+     commands.push(`0.84 G 0.25 w ${x} ${y+3.2} m ${x+244} ${y+3.2} l S 0 G`);
+     y-=4.4;
+   });
+ };
+ drawColumn(left,36);
+ drawColumn(right,315);
+ const stream=commands.join("\n");
+ const objects=[
+   "<< /Type /Catalog /Pages 2 0 R >>",
+   "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+   "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 4 0 R /F2 5 0 R >> >> /Contents 6 0 R >>",
+   "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+   "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>",
+   `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`
+ ];
+ let pdf="%PDF-1.4\n%\xE2\xE3\xCF\xD3\n";
+ const offsets=[0];
+ objects.forEach((object,index)=>{
+   offsets[index+1]=pdf.length;
+   pdf+=`${index+1} 0 obj\n${object}\nendobj\n`;
+ });
+ const xref=pdf.length;
+ pdf+=`xref\n0 ${objects.length+1}\n0000000000 65535 f \n`;
+ for(let index=1;index<=objects.length;index++)pdf+=`${String(offsets[index]).padStart(10,"0")} 00000 n \n`;
+ pdf+=`trailer\n<< /Size ${objects.length+1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`;
+ return new Blob([Uint8Array.from(pdf,char=>char.charCodeAt(0)&255)],{type:"application/pdf"});
+}
+async function printServiceSheet(){
  const sheet=document.querySelector("#printSheet");
  if(!sheet||!sheet.innerHTML.trim())return;
  const isMobile=/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
@@ -552,32 +627,30 @@ function printServiceSheet(){
    window.print();
    return;
  }
- const printWindow=window.open("","_blank");
- if(!printWindow){
-   window.print();
-   return;
+ const model=sheet.querySelector(".print-model")?.textContent.trim()||"VOGE";
+ const km=sheet.querySelector(".print-km")?.textContent.trim()||"revision";
+ const fileName=`${model}-${km}`.replace(/[^\w.-]+/g,"-")+".pdf";
+ const pdfBlob=createServicePdf(sheet);
+ const pdfFile=new File([pdfBlob],fileName,{type:"application/pdf"});
+ if(navigator.share&&navigator.canShare?.({files:[pdfFile]})){
+   try{
+     await navigator.share({files:[pdfFile],title:`${model} · ${km}`});
+     return;
+   }catch(error){
+     if(error?.name==="AbortError")return;
+   }
  }
- const title=[sheet.querySelector(".print-model")?.textContent,sheet.querySelector(".print-km")?.textContent].filter(Boolean).join(" · ");
- printWindow.document.open();
- printWindow.document.write(`<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title><style>
- @page{size:A4 portrait;margin:8mm}
- *{box-sizing:border-box}
- body{margin:0;padding:8mm;background:#fff;color:#111;font-family:Arial,Helvetica,sans-serif}
- #printSheet{display:block;width:auto;margin:0;padding:0}
- .print-header{display:flex;align-items:baseline;justify-content:space-between;gap:10mm;margin:0 0 6mm;padding:0 0 4mm;border-bottom:2px solid #111}
- .print-model,.print-km{margin:0;font-size:23pt;font-weight:900;line-height:1}
- .print-km{text-align:right}
- .print-tasks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1.2mm 7mm;font-size:10.5pt;line-height:1.28}
- .print-tasks.dense{gap:1mm 6mm;font-size:9.5pt;line-height:1.24}
- .print-task{break-inside:avoid;min-width:0;margin:0;padding:1.8mm 0;border-bottom:.2mm solid #d5d5d5}
- .print-task b{font-weight:900}
- .mobile-print-action{position:sticky;top:0;z-index:2;margin:-4mm -4mm 6mm;padding:4mm;background:#fff;border-bottom:1px solid #ddd}
- .mobile-print-action button{width:100%;min-height:46px;border:0;border-radius:7px;background:#ffea00;color:#111;font:900 13px Arial,sans-serif;text-transform:uppercase}
- @media print{body{padding:0}.mobile-print-action{display:none}}
- </style></head><body><div class="mobile-print-action"><button type="button" onclick="window.print()">Imprimir / guardar PDF</button></div>${sheet.outerHTML}</body></html>`);
- printWindow.document.close();
- printWindow.opener=null;
- setTimeout(()=>{try{printWindow.focus();printWindow.print()}catch(error){}},400);
+ const pdfUrl=URL.createObjectURL(pdfBlob);
+ const preview=window.open(pdfUrl,"_blank");
+ if(!preview){
+   const download=document.createElement("a");
+   download.href=pdfUrl;
+   download.download=fileName;
+   document.body.appendChild(download);
+   download.click();
+   download.remove();
+ }
+ setTimeout(()=>URL.revokeObjectURL(pdfUrl),60000);
 }
 
 function fill(){
